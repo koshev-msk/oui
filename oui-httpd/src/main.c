@@ -42,9 +42,6 @@ enum {
     LONG_OPT_DB
 };
 
-static const char *home_dir = ".";
-static const char *index_page = "oui.html";
-
 void serve_upload(struct uh_connection *conn, int event);
 
 void serve_download(struct uh_connection *conn, int event);
@@ -54,7 +51,7 @@ static void default_handler(struct uh_connection *conn, int event)
     if (event != UH_EV_COMPLETE)
         return;
 
-    conn->serve_file(conn, home_dir, index_page);
+    conn->serve_file(conn);
 }
 
 static void signal_cb(struct ev_loop *loop, ev_signal *w, int revents)
@@ -62,7 +59,6 @@ static void signal_cb(struct ev_loop *loop, ev_signal *w, int revents)
     if (w->signum == SIGINT) {
         ev_break(loop, EVBREAK_ALL);
         uh_log_info("Normal quit\n");
-    } else if (w->signum == SIGUSR1) {
     }
 }
 
@@ -76,6 +72,7 @@ static void usage(const char *prog)
                     "          --home dir        # document root(default is .)\n"
                     "          --index oui.html  # index page(default is oui.html)\n"
                     "          --db oh.db        # database file(default is ./oh.db)\n"
+                    "          -w n              # worker process number (default automatically to available CPUs)\n"
                     "          -v                # verbose\n", prog);
     exit(1);
 }
@@ -91,11 +88,12 @@ int main(int argc, char **argv)
 {
     struct ev_loop *loop;
     struct ev_signal sigint_watcher;
-    struct ev_signal sigusr1_watcher;
     struct uh_server *srv = NULL;
     const char *addr = "0.0.0.0";
     const char *rpc_dir = ".";
     const char *db = "oh.db";
+    const char *home_dir = ".";
+    const char *index_page = "oui.html";
     bool verbose = false;
     int port = 8080;
     int option_index;
@@ -151,17 +149,16 @@ int main(int argc, char **argv)
         goto err;
     }
 
-    srv->default_handler = default_handler;
+    srv->set_docroot(srv, home_dir);
+    srv->set_index_page(srv, index_page);
 
+    srv->set_default_handler(srv, default_handler);
     srv->add_path_handler(srv, "/rpc", serve_rpc);
     srv->add_path_handler(srv, "/upload", serve_upload);
     srv->add_path_handler(srv, "/download", serve_download);
 
     ev_signal_init(&sigint_watcher, signal_cb, SIGINT);
     ev_signal_start(loop, &sigint_watcher);
-
-    ev_signal_init(&sigusr1_watcher, signal_cb, SIGUSR1);
-    ev_signal_start(loop, &sigusr1_watcher);
 
     ev_run(loop, 0);
 
