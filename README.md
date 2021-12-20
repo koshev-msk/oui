@@ -15,6 +15,7 @@
 [![PRs Welcome][3]][4]
 [![Issue Welcome][5]][6]
 [![Build Status][7]][8]
+![visitors](https://visitor-badge.laobi.icu/badge?page_id=zhaojh329.oui)
 [![Support oui][9]][10]
 
 [vue.js]: https://github.com/vuejs/vue
@@ -34,9 +35,10 @@ Oui is especially suitable for enterprise custom development.
 # How to build
 ## Add feeds
 
-	echo "src-git oui https://github.com/zhaojh329/oui.git" >> feeds.conf.default
+	sed -i '1i\src-git oui https://github.com/zhaojh329/oui.git' feeds.conf.default
 	./scripts/feeds update oui
-	./scripts/feeds install -a -p oui
+	./scripts/feeds uninstall -a
+	./scripts/feeds install -a
 
 ## Configure
 
@@ -85,7 +87,6 @@ Oui is especially suitable for enterprise custom development.
 ```
 	npm install
 	npm run build
-	../../scripts/clean-dist.sh dist
 ```
 ## application
 1. Modify
@@ -97,7 +98,7 @@ Oui is especially suitable for enterprise custom development.
 ```
 	npm install
 	npm run build
-	cp dist/app.common.js.gz ../applications/oui-app-example/vue/dist/app.js
+	cp dist/app.common.js ../applications/oui-app-example/vue/dist/app.js
 ```
 # How to debug vue for application(e.g. oui-app-example)
 1. Copy oui-app-example/vue/app.vue to oui-ui-core/vue/src/views/oui-app-example.vue

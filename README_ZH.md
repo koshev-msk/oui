@@ -17,6 +17,7 @@
 [![PRs Welcome][3]][4]
 [![Issue Welcome][5]][6]
 [![Build Status][7]][8]
+![visitors](https://visitor-badge.laobi.icu/badge?page_id=zhaojh329.oui)
 [![Support oui][9]][10]
 [![Chinese Chat][11]][12]
 
@@ -37,9 +38,10 @@ Oui特别适合用于企业定制开发。
 # 如何编译
 ## 添加 feeds
 
-	echo "src-git oui https://github.com/zhaojh329/oui.git" >> feeds.conf.default
+	sed -i '1i\src-git oui https://gitee.com/zhaojh329/oui.git' feeds.conf.default
 	./scripts/feeds update oui
-	./scripts/feeds install -a -p oui
+	./scripts/feeds uninstall -a
+	./scripts/feeds install -a
 
 ## 配置
 
@@ -89,7 +91,6 @@ Oui特别适合用于企业定制开发。
 ```
 	npm install
 	npm run build
-	../../scripts/clean-dist.sh dist
 ```
 ## Application
 1. 修改
@@ -101,7 +102,7 @@ Oui特别适合用于企业定制开发。
 ```
 	npm install
 	npm run build
-	cp dist/app.common.js.gz ../applications/oui-app-example/vue/dist/app.js
+	cp dist/app.common.js ../applications/oui-app-example/vue/dist/app.js
 ```
 # 如何调试 Application(例如 oui-app-example)
 1. 拷贝 oui-app-example/vue/app.vue 到 oui-ui-core/vue/src/views/oui-app-example.vue

@@ -1,5 +1,4 @@
 const CompressionPlugin = require('compression-webpack-plugin')
-const path = require('path')
 
 module.exports = {
   productionSourceMap: false,
@@ -10,8 +9,10 @@ module.exports = {
     if (process.env.NODE_ENV === 'production') {
       return {
         plugins: [new CompressionPlugin({
-          test: /\.js$|\.html$|\.css/,
-          threshold: 4096
+          test: /\.js$|\.css$/,
+          threshold: 4096,
+          deleteOriginalAssets: true,
+          filename: '[path][base]?gz'
         })]
       }
     }

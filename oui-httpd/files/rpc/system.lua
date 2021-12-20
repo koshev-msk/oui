@@ -1,5 +1,6 @@
 local utils = require "oui.utils"
 local rpc = require "oui.rpc"
+local fs = require "oui.fs"
 
 local M = {}
 
@@ -11,7 +12,7 @@ function M.diskfree()
     local resp = {}
 
     for name, path in pairs(fslist) do
-        local total, free, used = utils.statvfs(path)
+        local total, free, used = fs.statvfs(path)
         if total then
             resp[name] = {
                 total = total,
@@ -99,10 +100,10 @@ end
 
 function M.init_list()
     local initscripts = {}
-    local f = io.popen("ls /etc/init.d")
-    if f then
-        for name in f:lines() do
-            local start, stop, enabled = false
+
+    for name in fs.dir("/etc/init.d") do
+        if name:sub(1, 1) ~= "." then
+            local start, stop, enabled
             local line = utils.readfile("/etc/init.d/" .. name, "*l")
             if line and line:match("/etc/rc.common") then
                 for line in io.lines("/etc/init.d/" .. name) do
@@ -123,13 +124,13 @@ function M.init_list()
                         name = name,
                         start = tonumber(start),
                         stop = tonumber(stop),
-                        enabled = enabled
+                        enabled = fs.access("/etc/rc.d/S" .. start .. name)
                     }
                 end
             end
         end
-        f:close()
     end
+
     return { initscripts = initscripts }
 end
 
@@ -150,9 +151,9 @@ end
 
 function M.led_list()
     local leds = {}
-    local f = io.popen("ls /sys/class/leds")
-    if f then
-        for name in f:lines() do
+
+    for name in fs.dir("/sys/class/leds") do
+        if name:sub(1, 1) ~= "." then
             local data = utils.readfile("/sys/class/leds/" .. name .. "/trigger")
             local active_trigger, brightness, max_brightness
             local triggers = {}
@@ -176,13 +177,13 @@ function M.led_list()
                 max_brightness = tonumber(max_brightness)
             }
         end
-        f:close()
     end
+
     return { leds = leds }
 end
 
 function M.factory()
-    os.execute("jffs2reset -y -r &")
+    utils.exec("jffs2reset", "-y", "-r")
 end
 
 return M

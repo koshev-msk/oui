@@ -25,21 +25,20 @@
 #ifndef __RPC_H
 #define __RPC_H
 
+#include <stdbool.h>
 #include <jansson.h>
 
 enum {
-    ERROR_CODE_PARSE_ERROR,
-    ERROR_CODE_INVALID_REQUEST,
-    ERROR_CODE_METHOD_NOT_FOUND,
-    ERROR_CODE_INVALID_PARAMS,
-    ERROR_CODE_INTERNAL_ERROR,
+    RPC_ERROR_CODE_NONE,
+    RPC_ERROR_CODE_PARSE_ERROR = -32700,
+    RPC_ERROR_CODE_INVALID_REQUEST = -32600,
+    RPC_ERROR_CODE_METHOD_NOT_FOUND = -32601,
+    RPC_ERROR_CODE_INVALID_PARAMS = -32602,
+    RPC_ERROR_CODE_INTERNAL_ERROR = -32603,
 
     /* Custom error code */
-    ERROR_CODE_ACCESS,
-    ERROR_CODE_NOT_FOUND,
-    ERROR_CODE_TIMEOUT,
-
-    __ERROR_CODE_MAX
+    RPC_ERROR_CODE_ACCESS = -32000,
+    RPC_ERROR_CODE_NOT_FOUND = -32001
 };
 
 enum {
@@ -47,6 +46,8 @@ enum {
     RPC_METHOD_RETURN_ERROR = -1,
     RPC_METHOD_RETURN_DEFERRED = 1
 };
+
+#define RPC_MAX_WORKER_NUM  10
 
 struct uh_connection;
 
@@ -58,9 +59,9 @@ struct rpc_method_entry {
     rpc_method_prototype handler;
 };
 
-void rpc_init(const char *path);
+int rpc_init(struct ev_loop *loop, const char *path, bool local_auth, const char *no_auth_file, int nworker);
 
-void rpc_deinit();
+void rpc_deinit(struct ev_loop *loop);
 
 void serve_rpc(struct uh_connection *conn, int event);
 

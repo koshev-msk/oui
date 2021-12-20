@@ -22,9 +22,6 @@
  * SOFTWARE.
  */
 
-#include <libubox/avl-cmp.h>
-#include <libubox/utils.h>
-#include <libubox/md5.h>
 #include <uhttpd/log.h>
 #include <sqlite3.h>
 #include <string.h>
@@ -32,6 +29,8 @@
 #include <stdio.h>
 
 #include "session.h"
+#include "utils.h"
+#include "md5.h"
 #include "db.h"
 
 struct login_param {
@@ -39,7 +38,8 @@ struct login_param {
     char pwhash[33];
 };
 
-static struct avl_tree sessions;
+static LIST_HEAD(sessions);
+static int nsession;
 
 static int generate_sid(char *dest)
 {
@@ -82,7 +82,7 @@ static void session_destroy(struct session *s)
 
     ev_timer_stop(loop, &s->tmr);
 
-    avl_delete(&sessions, &s->avl);
+    list_del(&s->node);
     free(s);
 }
 
@@ -97,12 +97,12 @@ static struct session *session_create(int timeout, const char *username, const c
     struct session *s;
 
     if (strlen(username) > MAX_USERNAME_LEN) {
-        uh_log_err("username '%s' too long, more than %d characters\n", username, MAX_USERNAME_LEN);
+        log_err("username '%s' too long, more than %d characters\n", username, MAX_USERNAME_LEN);
         return NULL;
     }
 
     if (strlen(aclgroup) > MAX_ACLGROUP_LEN) {
-        uh_log_err("aclgroup '%s' too long, more than %d characters\n", aclgroup, MAX_ACLGROUP_LEN);
+        log_err("aclgroup '%s' too long, more than %d characters\n", aclgroup, MAX_ACLGROUP_LEN);
         return NULL;
     }
 
@@ -110,10 +110,11 @@ static struct session *session_create(int timeout, const char *username, const c
     if (!s)
         return NULL;
 
-    if (generate_sid(s->id))
+    if (generate_sid(s->id)) {
+        free(s);
         return NULL;
+    }
 
-    s->avl.key = s->id;
     s->timeout = timeout;
 
     ev_timer_init(&s->tmr, session_timeout_cb, s->timeout, 0);
@@ -121,9 +122,11 @@ static struct session *session_create(int timeout, const char *username, const c
     strncpy(s->username, username, sizeof(s->username) - 1);
     strncpy(s->aclgroup, aclgroup, sizeof(s->aclgroup) - 1);
 
-    avl_insert(&sessions, &s->avl);
+    list_add(&s->node, &sessions);
 
     touch_session(s);
+
+    nsession++;
 
     return s;
 }
@@ -135,12 +138,14 @@ struct session *session_get(const char *sid)
     if (!sid)
         return NULL;
 
-    s = avl_find_element(&sessions, sid, s, avl);
-    if (!s)
-        return NULL;
+    list_for_each_entry(s, &sessions, node) {
+        if (!strcmp(s->id, sid)) {
+            touch_session(s);
+            return s;
+        }
+    }
 
-    touch_session(s);
-    return s;
+    return NULL;
 }
 
 static inline int hex2num(int x)
@@ -177,6 +182,9 @@ const char *session_login(const char *username, const char *password)
     char sql[256];
     int i;
 
+    if (nsession == MAX_SESSION)
+        return NULL;
+
     sprintf(sql, "SELECT acl, password FROM account WHERE username = '%s'", username);
 
     if (db_query(sql, login_cb, &param) < 0)
@@ -196,7 +204,7 @@ const char *session_login(const char *username, const char *password)
             return NULL;
     }
 
-    s = session_create(DEFAULT_SESSION_TIMEOUT, username, param.aclgroup);
+    s = session_create(SESSION_TIMEOUT, username, param.aclgroup);
 
     return s ? s->id : NULL;
 }
@@ -208,16 +216,11 @@ void session_logout(const char *sid)
         session_destroy(s);
 }
 
-void session_init()
-{
-    avl_init(&sessions, avl_strcmp, false, NULL);
-}
-
 static void free_all_session()
 {
     struct session *s, *temp;
 
-    avl_for_each_element_safe(&sessions, s, avl, temp) {
+    list_for_each_entry_safe(s, temp, &sessions, node) {
         session_destroy(s);
     }
 }

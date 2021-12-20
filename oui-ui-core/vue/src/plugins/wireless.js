@@ -9,7 +9,7 @@ wireless.getDevices = function () {
       return
     }
 
-    rpc.ubus('iwinfo', 'devices').then(r => {
+    rpc.call('iwinfo', 'devices').then(r => {
       this.devices = r.devices || []
       resolve(this.devices)
     })
@@ -27,14 +27,19 @@ wireless.getAssoclist = function () {
       }
 
       devices.forEach(dev => {
-        promises.push(rpc.ubus('iwinfo', 'assoclist', { device: dev }))
+        promises.push(rpc.call('iwinfo', 'assoclist', { device: dev }))
       })
 
       Promise.all(promises).then(rs => {
         const assoclist = []
 
         rs.forEach(r => {
-          assoclist.push(...r.results)
+          if (Array.isArray(r)) r = {}
+          for (const mac in r) {
+            const sta = r[mac]
+            sta.mac = mac
+            assoclist.push(sta)
+          }
         })
 
         resolve(assoclist)

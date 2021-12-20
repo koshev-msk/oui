@@ -23,9 +23,9 @@
  */
 
 #include <uhttpd/uhttpd.h>
-#include <uhttpd/buffer.h>
-#include <libubox/avl.h>
-#include <libubox/avl-cmp.h>
+#include <sys/sysinfo.h>
+#include <netinet/in.h>
+#include <pthread.h>
 #include <lauxlib.h>
 #include <sqlite3.h>
 #include <dirent.h>
@@ -33,8 +33,6 @@
 #include <lualib.h>
 #include <unistd.h>
 #include <errno.h>
-#include <time.h>
-#include <uci.h>
 
 #include "lua2json.h"
 #include "session.h"
@@ -42,60 +40,66 @@
 #include "rpc.h"
 #include "db.h"
 
-static const struct {
-    int code;
-    const char *msg;
-} rpc_errors[] = {
-    [ERROR_CODE_PARSE_ERROR] = {-32700, "Parse error"},
-    [ERROR_CODE_INVALID_REQUEST] = {-32600, "Invalid Request"},
-    [ERROR_CODE_METHOD_NOT_FOUND] = {-32601, "Method not found"},
-    [ERROR_CODE_INVALID_PARAMS] = {-32602, "Invalid params"},
-    [ERROR_CODE_INTERNAL_ERROR] = {-32603, "Internal error"},
-    [ERROR_CODE_ACCESS] = {-32000, "Access denied"},
-    [ERROR_CODE_NOT_FOUND] = {-32001, "Not found"},
-    [ERROR_CODE_TIMEOUT] = {-32002, "Timeout"}
+struct rpc_context {
+    struct ev_loop *loop;
+    const char *root;
+    bool local_auth;
+    struct list_head run_queue;
+    struct list_head end_queue;
+    struct ev_async end_watcher;
+    json_t *no_auth_methods;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int nworker;
+    bool done;
 };
 
-struct rpc_exec_context {
+struct rpc_call_context {
+    struct list_head node;
     struct uh_connection *conn;
-    struct ev_timer tmr;
-    struct ev_child child;
-    int stdout_fd;
-    int stderr_fd;
+    const char *object;
+    const char *method;
+    struct session *s;
+    bool is_local;
+    json_t *params;
+    json_t *args;
     json_t *id;
-    pid_t pid;
+    json_t *res;
 };
 
-struct rpc_object {
-    struct avl_tree trusted_methods;
-    struct avl_node avl;
-    lua_State *L;
-    char value[0];
-};
+static struct rpc_context rpc_context;
 
-struct rpc_trusted_method {
-    struct avl_node avl;
-    char value[0];
-};
 
-static struct avl_tree rpc_objects;
-
-static json_t *rpc_error_object(int code, const char *message, json_t *data)
+static const char *rpc_error_message(int code)
 {
-    json_t *json = json_pack("{s:i,s:s}", "code", code, "message", message ? message : "");
-
-    if (data)
-        json_object_set_new(json, "data", data);
-
-    return json;
+    switch (code) {
+    case RPC_ERROR_CODE_PARSE_ERROR:
+        return "Parse error";
+    case RPC_ERROR_CODE_INVALID_REQUEST:
+        return "Invalid Request";
+    case RPC_ERROR_CODE_METHOD_NOT_FOUND:
+        return "Method not found";
+    case RPC_ERROR_CODE_INVALID_PARAMS:
+        return "Invalid params";
+    case RPC_ERROR_CODE_INTERNAL_ERROR:
+        return "Internal error";
+    case RPC_ERROR_CODE_ACCESS:
+        return "Access denied";
+    case RPC_ERROR_CODE_NOT_FOUND:
+        return "Not found";
+    default:
+        return "Unknown";
+    }
 }
 
-static json_t *rpc_error_object_predefined(int code, json_t *data)
+static json_t *rpc_error_object(int code, json_t *data)
 {
-    if (code > -1 && code < __ERROR_CODE_MAX)
-        return rpc_error_object(rpc_errors[code].code, rpc_errors[code].msg, data);
-    else
-        return rpc_error_object(code, NULL, data);
+    json_t *res = json_pack("{s:i,s:s}", "code", code, "message", rpc_error_message(code));
+
+    if (data)
+        json_object_set_new(res, "data", data);
+
+    return res;
 }
 
 static json_t *rpc_error_response(json_t *id, json_t *error)
@@ -163,55 +167,42 @@ static json_t *rpc_validate_request(json_t *req, const char **method, json_t **p
     return NULL;
 
 invalid:
-    return rpc_error_response(*id, rpc_error_object_predefined(ERROR_CODE_INVALID_REQUEST, data));
+    return rpc_error_response(*id, rpc_error_object(RPC_ERROR_CODE_INVALID_REQUEST, data));
+}
+
+static int rpc_json_dump_callback(const char *buffer, size_t size, void *data)
+{
+    struct uh_connection *conn = data;
+
+    conn->send(conn, buffer, size);
+
+    return 0;
 }
 
 static void rpc_handle_done_final(struct uh_connection *conn, json_t *resp)
 {
-    size_t size;
-    char *s;
-
     if (!resp) {
-        conn->error(conn, HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+        conn->send_error(conn, HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
         return;
     }
 
-    s = json_dumps(resp, 0);
-    if (!s) {
-        conn->error(conn, HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
-        return;
-    }
+    conn->send_head(conn, HTTP_STATUS_OK, -1, NULL);
+    conn->send_header(conn, "Content-Type", "application/json");
+    conn->end_headers(conn);
 
+    json_dump_callback(resp, rpc_json_dump_callback, conn, 0);
     json_decref(resp);
 
-    size = strlen(s);
-
-    conn->send_head(conn, HTTP_STATUS_OK, size, "Content-Type: application/json\r\n");
-    conn->send(conn, s, size);
-    conn->done(conn);
-
-    free(s);
+    conn->end_response(conn);
 }
 
-static void rpc_handle_done_deferred(struct uh_connection *conn, json_t *id, json_t *result, bool is_error)
+static bool rpc_is_no_auth(const char *object, const char *method)
 {
-    json_t *resp;
+    json_t *obj = json_object_get(rpc_context.no_auth_methods, object);
+    if (!json_is_object(obj))
+        return false;
 
-    if (is_error)
-        resp = rpc_error_response(id, result);
-    else
-        resp = rpc_result_response(id, result);
-
-    json_decref(id);
-
-    rpc_handle_done_final(conn, resp);
-}
-
-static bool rpc_is_trusted(struct rpc_object *obj, const char *method)
-{
-    struct rpc_trusted_method *m;
-
-    return avl_find_element(&obj->trusted_methods, method, m, avl);
+    return json_object_get(obj, method);
 }
 
 static int rpc_access_cb(void *data, int count, char **value, char **name)
@@ -239,39 +230,19 @@ static bool rpc_call_access(struct session *s, const char *object, const char *m
     return strchr(perm, 'x');
 }
 
-static bool rpc_exec_access(struct session *s, const char *cmd)
-{
-    char perm[5] = "";
-    char sql[128];
-
-    /* The admin acl group is always allowed */
-    if (!strcmp(s->aclgroup, "admin"))
-        return true;
-
-    sprintf(sql, "SELECT permissions FROM acl_%s WHERE scope = 'exec' AND entry = '*'", s->aclgroup);
-
-    if (db_query(sql, rpc_access_cb, perm) < 0) {
-        sprintf(sql, "SELECT permissions FROM acl_%s WHERE scope = 'exec' AND entry = '%s'", s->aclgroup, cmd);
-        if (db_query(sql, rpc_access_cb, perm) < 0)
-            return false;
-    }
-
-    return strchr(perm, 'x');
-}
-
 static int rpc_method_login(struct uh_connection *conn, json_t *id, json_t *params, json_t **result)
 {
     const char *username, *password = "", *sid;
     json_error_t error;
 
     if (json_unpack_ex(params, &error, 0, "{s:s,s?s}", "username", &username, "password", &password) < 0) {
-        *result = rpc_error_object_predefined(ERROR_CODE_INVALID_PARAMS, json_string(error.text));
+        *result = rpc_error_object(RPC_ERROR_CODE_INVALID_PARAMS, json_string(error.text));
         return RPC_METHOD_RETURN_ERROR;
     }
 
     sid = session_login(username, password);
     if (!sid) {
-        *result = rpc_error_object_predefined(ERROR_CODE_ACCESS, NULL);
+        *result = rpc_error_object(RPC_ERROR_CODE_ACCESS, NULL);
         return RPC_METHOD_RETURN_ERROR;
     }
 
@@ -286,7 +257,7 @@ static int rpc_method_logout(struct uh_connection *conn, json_t *id, json_t *par
     const char *sid;
 
     if (json_unpack_ex(params, &error, 0, "{s:s}", "sid", &sid) < 0) {
-        *result = rpc_error_object_predefined(ERROR_CODE_INVALID_PARAMS, json_string(error.text));
+        *result = rpc_error_object(RPC_ERROR_CODE_INVALID_PARAMS, json_string(error.text));
         return RPC_METHOD_RETURN_ERROR;
     }
 
@@ -301,288 +272,81 @@ static int rpc_method_alive(struct uh_connection *conn, json_t *id, json_t *para
     const char *sid;
 
     if (json_unpack_ex(params, &error, 0, "{s:s}", "sid", &sid) < 0) {
-        *result = rpc_error_object_predefined(ERROR_CODE_INVALID_PARAMS, json_string(error.text));
+        *result = rpc_error_object(RPC_ERROR_CODE_INVALID_PARAMS, json_string(error.text));
         return RPC_METHOD_RETURN_ERROR;
     }
 
     if (!session_get(sid)) {
-        *result = rpc_error_object_predefined(ERROR_CODE_ACCESS, NULL);
+        *result = rpc_error_object(RPC_ERROR_CODE_ACCESS, NULL);
         return RPC_METHOD_RETURN_ERROR;
     }
 
     return RPC_METHOD_RETURN_SUCCESS;
 }
 
-static void rpc_exec_timeout_cb(struct ev_loop *loop, struct ev_timer *w, int revents)
-{
-    struct rpc_exec_context *ctx = container_of(w, struct rpc_exec_context, tmr);
-    json_t *res;
-
-    ev_child_stop(loop, &ctx->child);
-
-    kill(ctx->pid, SIGKILL);
-
-    close(ctx->stdout_fd);
-    close(ctx->stderr_fd);
-
-    res = rpc_error_object_predefined(ERROR_CODE_TIMEOUT, NULL);
-    rpc_handle_done_deferred(ctx->conn, ctx->id, res, true);
-
-    free(ctx);
-}
-
-static void rpc_exec_read(int fd, json_t *res, const char *name)
-{
-    struct buffer b = {};
-    uint8_t buf[1024];
-
-    for (;;) {
-        ssize_t nr = read(fd, buf, sizeof(buf));
-        if (nr <= 0)
-            break;
-        buffer_put_data(&b, buf, nr);
-    }
-
-    if (buffer_length(&b) == 0)
-        json_object_set_new(res, name, json_string(""));
-    else
-        json_object_set_new(res, name, json_stringn(buffer_data(&b), buffer_length(&b)));
-
-    buffer_free(&b);
-
-    close(fd);
-}
-
-static void rpc_exec_child_exit(struct ev_loop *loop, struct ev_child *w, int revents)
-{
-    struct rpc_exec_context *ctx = container_of(w, struct rpc_exec_context, child);
-    json_t *res;
-
-    /* Avoid conflicts caused by two same pid */
-    ev_child_stop(loop, w);
-
-    ev_timer_stop(loop, &ctx->tmr);
-
-    res = json_pack("{s:i}", "code", WEXITSTATUS(w->rstatus));
-
-    rpc_exec_read(ctx->stdout_fd, res, "stdout");
-    rpc_exec_read(ctx->stderr_fd, res, "stderr");
-
-    rpc_handle_done_deferred(ctx->conn, ctx->id, res, false);
-
-    free(ctx);
-}
-
-static int rpc_method_exec(struct uh_connection *conn, json_t *id, json_t *params, json_t **result)
-{
-    bool is_local = is_loopback_addr(conn->get_addr(conn));
-    const char *sid, *cmd;
-    struct session *s;
-    json_error_t error;
-    int opipe[2] = {};
-    int epipe[2] = {};
-    pid_t pid;
-
-    if (json_unpack_ex(params, &error, 0, "[ss]", &sid, &cmd) < 0) {
-        *result = rpc_error_object_predefined(ERROR_CODE_INVALID_PARAMS, json_string(error.text));
-        return RPC_METHOD_RETURN_ERROR;
-    }
-
-    s = session_get(sid);
-
-    if (!is_local && (!s || !rpc_exec_access(s, cmd))) {
-        *result = rpc_error_object_predefined(ERROR_CODE_ACCESS, NULL);
-        return RPC_METHOD_RETURN_ERROR;
-    }
-
-    if (which(cmd)) {
-        *result = rpc_error_object_predefined(ERROR_CODE_NOT_FOUND, json_string("Command not found"));
-        return RPC_METHOD_RETURN_ERROR;
-    }
-
-    if (pipe(opipe) < 0 || pipe(epipe) < 0)
-        goto err;
-
-    pid = fork();
-    if (pid < 0) {
-        goto err;
-    } else if (pid == 0) {
-        const char **args;
-        json_t *p;
-        int i, j;
-
-        /* Close unused read end */
-        close(opipe[0]);
-        close(epipe[0]);
-
-        /* Redirect */
-        dup2(opipe[1], STDOUT_FILENO);
-        dup2(epipe[1], STDERR_FILENO);
-        close(opipe[1]);
-        close(epipe[1]);
-
-        args = malloc(sizeof(char *) * 2);
-
-        args[0] = cmd;
-        args[1] = NULL;
-
-        j = 1;
-
-        json_array_foreach(params, i, p) {
-            if (i < 2 || !json_is_string(p))
-                continue;
-            args = realloc(args, sizeof(char *) * (2 + j));
-            args[j++] = json_string_value(p);
-            args[j] = NULL;
-        }
-
-        execvp(cmd, (char *const *) args);
-    } else {
-        struct rpc_exec_context *ctx = calloc(1, sizeof(struct rpc_exec_context));
-        struct ev_loop *loop = conn->get_loop(conn);
-
-        /* Close unused write end */
-        close(opipe[1]);
-        close(epipe[1]);
-
-        ctx->conn = conn;
-        ctx->pid = pid;
-        ctx->id = id;
-
-        ctx->stdout_fd = opipe[0];
-        ctx->stderr_fd = epipe[0];
-
-        ev_timer_init(&ctx->tmr, rpc_exec_timeout_cb, 30, 0);
-        ev_timer_start(loop, &ctx->tmr);
-
-        ev_child_init(&ctx->child, rpc_exec_child_exit, pid, 0);
-        ev_child_start(loop, &ctx->child);
-    }
-
-    return RPC_METHOD_RETURN_DEFERRED;
-
-err:
-    if (opipe[0] > 0) {
-        close(opipe[0]);
-        close(opipe[1]);
-    }
-
-    if (epipe[0] > 0) {
-        close(epipe[0]);
-        close(epipe[1]);
-    }
-
-    *result = rpc_error_object_predefined(ERROR_CODE_INTERNAL_ERROR, json_string(strerror(errno)));
-    return RPC_METHOD_RETURN_ERROR;
-}
-
 static int rpc_method_call(struct uh_connection *conn, json_t *id, json_t *params, json_t **result)
 {
-    bool is_local = is_loopback_addr(conn->get_addr(conn));
-    int ret = RPC_METHOD_RETURN_ERROR;
+    bool is_local = is_loopback_addr(conn->get_paddr(conn)) && !rpc_context.local_auth;
     const char *sid, *object, *method;
-    struct rpc_object *obj;
+    struct rpc_call_context *ctx;
+    const char *fmt = "[sss]";
     json_error_t error;
-    struct session *s;
-    json_t *args;
-    lua_State *L;
+    json_t *args = NULL;
 
-    if (json_unpack_ex(params, &error, 0, "[ssso!]", &sid, &object, &method, &args) < 0) {
-        *result = rpc_error_object_predefined(ERROR_CODE_INVALID_PARAMS, json_string(error.text));
+    if (!json_is_array(params)) {
+        *result = rpc_error_object(RPC_ERROR_CODE_INVALID_PARAMS, json_string("Expected array, got object"));
         return RPC_METHOD_RETURN_ERROR;
     }
 
-    if (!json_is_object(args)) {
-        *result = rpc_error_object_predefined(ERROR_CODE_INVALID_PARAMS,
+    if (json_array_size(params) > 3)
+        fmt = "[ssso]";
+
+    if (json_unpack_ex(params, &error, 0, fmt, &sid, &object, &method, &args) < 0) {
+        *result = rpc_error_object(RPC_ERROR_CODE_INVALID_PARAMS, json_string(error.text));
+        return RPC_METHOD_RETURN_ERROR;
+    }
+
+    if (args && !json_is_object(args)) {
+        *result = rpc_error_object(RPC_ERROR_CODE_INVALID_PARAMS,
                                               json_string("The argument must be an object"));
         return RPC_METHOD_RETURN_ERROR;
     }
 
-    obj = avl_find_element(&rpc_objects, object, obj, avl);
-    if (!obj) {
-        *result = rpc_error_object_predefined(ERROR_CODE_NOT_FOUND, json_string("Object not found"));
+    ctx = calloc(1, sizeof(struct rpc_call_context));
+    if (!ctx) {
+        *result = rpc_error_object(RPC_ERROR_CODE_INTERNAL_ERROR, NULL);
         return RPC_METHOD_RETURN_ERROR;
     }
 
-    L = obj->L;
+    conn->incref(conn);
 
-    if (!lua_istable(L, -1)) {
-        uh_log_err("%s.%s: lua state is broken. No table on stack!\n", object, method);
-        *result = rpc_error_object_predefined(ERROR_CODE_INTERNAL_ERROR, NULL);
-        return RPC_METHOD_RETURN_ERROR;
-    }
+    ctx->s = session_get(sid);
+    ctx->is_local = is_local;
+    ctx->object = object;
+    ctx->method = method;
+    ctx->params = params;
+    ctx->conn = conn;
+    ctx->args = args;
+    ctx->id = id;
 
-    lua_getfield(L, -1, method);
-    if (!lua_isfunction(L, -1)) {
-        *result = rpc_error_object_predefined(ERROR_CODE_NOT_FOUND, json_string("Method not found"));
-        goto done;
-    }
+    json_incref(params);
+    json_incref(args);
 
-    s = session_get(sid);
+    pthread_mutex_lock(&rpc_context.mutex);
+    list_add_tail(&ctx->node, &rpc_context.run_queue);
+    pthread_mutex_unlock(&rpc_context.mutex);
 
-    if (!is_local && !rpc_is_trusted(obj, method) && (!s || !rpc_call_access(s, object, method))) {
-        *result = rpc_error_object_predefined(ERROR_CODE_ACCESS, NULL);
-        goto done;
-    }
+    pthread_cond_signal(&rpc_context.cond);
 
-    lua_newtable(L);
+    log_debug("prepare call %s.%s...\n", object, method);
 
-    if (s) {
-        lua_pushstring(L, s->username);
-        lua_setfield(L, -2, "username");
-
-        lua_pushstring(L, s->aclgroup);
-        lua_setfield(L, -2, "aclgroup");
-    }
-
-    lua_pushboolean(L, is_local);
-    lua_setfield(L, -2, "is_local");
-
-    lua_setglobal(L, "__oui_session");
-
-    if (args)
-        json_to_lua(args, L);
-    else
-        lua_newtable(L);
-
-    if (lua_pcall(L, 1, 2, 0)) {
-        const char *err_msg = lua_tostring(L, -1);
-        json_t *data = json_string(err_msg);
-
-        uh_log_err("%s\n", err_msg);
-        *result = rpc_error_object_predefined(ERROR_CODE_INTERNAL_ERROR, data);
-        goto done;
-    }
-
-    /*
-     * Return a number on failure (plus an error message as a second result)
-     * Return a table on success
-     * Return other type also as success, but the result will be ignored
-     */
-    if (lua_isnumber(L, -2)) {
-        json_t *data = NULL;
-
-        if (lua_isstring(L, -1))
-            data = json_string(lua_tostring(L, -1));
-        *result = rpc_error_object_predefined(lua_tointeger(L, -2), data);
-    } else {
-        if (lua_istable(L, -2))
-            *result = lua_to_json(L, -2, false);
-        ret = RPC_METHOD_RETURN_SUCCESS;
-    }
-
-    lua_pop(L, 1);
-
-done:
-    lua_pop(L, 1);
-    return ret;
+    return RPC_METHOD_RETURN_DEFERRED;
 }
 
 static struct rpc_method_entry methods[] = {
     {"login",  rpc_method_login},
     {"logout", rpc_method_logout},
     {"alive",  rpc_method_alive},
-    {"exec",   rpc_method_exec},
     {"call",   rpc_method_call},
     {}
 };
@@ -603,7 +367,7 @@ static void rpc_handle_request(struct uh_connection *conn, json_t *req)
     }
 
     if (!entry->name) {
-        resp = rpc_error_response(id, rpc_error_object_predefined(ERROR_CODE_METHOD_NOT_FOUND, NULL));
+        resp = rpc_error_response(id, rpc_error_object(RPC_ERROR_CODE_METHOD_NOT_FOUND, NULL));
         goto done;
     }
 
@@ -618,7 +382,7 @@ static void rpc_handle_request(struct uh_connection *conn, json_t *req)
         json_incref(id);
         return;
     default:
-        resp = rpc_error_response(id, rpc_error_object_predefined(ERROR_CODE_INTERNAL_ERROR, NULL));
+        resp = rpc_error_response(id, rpc_error_object(RPC_ERROR_CODE_INTERNAL_ERROR, NULL));
         break;
     }
 
@@ -636,19 +400,19 @@ void serve_rpc(struct uh_connection *conn, int event)
         return;
 
     if (conn->get_method(conn) != HTTP_POST) {
-        conn->error(conn, HTTP_STATUS_METHOD_NOT_ALLOWED, NULL);
+        conn->send_error(conn, HTTP_STATUS_METHOD_NOT_ALLOWED, NULL);
         return;
     }
 
     body = conn->get_body(conn);
     req = json_loadb(body.p, body.len, 0, &error);
     if (!req) {
-        resp = rpc_error_response(NULL, rpc_error_object_predefined(ERROR_CODE_PARSE_ERROR, NULL));
+        resp = rpc_error_response(NULL, rpc_error_object(RPC_ERROR_CODE_PARSE_ERROR, NULL));
         goto err;
     }
 
     if (json_is_array(req)) {
-        resp = rpc_error_response(NULL, rpc_error_object_predefined(ERROR_CODE_INVALID_REQUEST,
+        resp = rpc_error_response(NULL, rpc_error_object(RPC_ERROR_CODE_INVALID_REQUEST,
                                                                     json_string("Not support batch")));
         goto err;
     }
@@ -661,179 +425,297 @@ err:
     json_decref(req);
 }
 
-static void load_rpc_scripts(const char *path)
+static void load_no_auth_methods(const char *file)
 {
-    DIR *dir;
-    struct dirent *e;
+    json_error_t error;
 
-    dir = opendir(path);
-    if (!dir) {
-        uh_log_err("opendir fail: %s\n", strerror(errno));
+    if (!file)
         return;
+
+    rpc_context.no_auth_methods = json_load_file(file, 0, &error);
+    if (!rpc_context.no_auth_methods) {
+        log_err("json_load_file '%s' fail: %s\n", file, error.text);
     }
+}
 
-    while ((e = readdir(dir))) {
-        char object_path[512] = "";
-        struct rpc_object *obj;
-        lua_State *L;
+static void *rpc_call_worker(void *arg)
+{
+    struct rpc_call_context *ctx;
+    int id = (intptr_t)arg;
+    struct session *s;
+    char path[128];
+    lua_State *L;
+    bool is_err;
+    json_t *res;
 
-        if (e->d_type != DT_REG || e->d_name[0] == '.')
-            continue;
+    log_info("rpc worker(%d) running\n", id);
+
+    while (true) {
+        char remote_addr[INET6_ADDRSTRLEN];
+        int remote_port;
+
+        is_err = true;
+        res = NULL;
+
+        pthread_mutex_lock(&rpc_context.mutex);
+
+        if (rpc_context.done)
+            goto done;
+
+        while (list_empty(&rpc_context.run_queue)) {
+            pthread_cond_wait(&rpc_context.cond, &rpc_context.mutex);
+
+            if (rpc_context.done)
+                goto done;
+        }
+
+        ctx = list_first_entry(&rpc_context.run_queue, struct rpc_call_context, node);
+
+        list_del(&ctx->node);
+
+        pthread_mutex_unlock(&rpc_context.mutex);
+
+        snprintf(path, sizeof(path), "%s/%s", rpc_context.root, ctx->object);
 
         L = luaL_newstate();
 
         luaL_openlibs(L);
 
-        snprintf(object_path, sizeof(object_path) - 1, "%s/%s", path, e->d_name);
-
-        if (luaL_dofile(L, object_path)) {
-            uh_log_err("load rpc: %s\n", lua_tostring(L, -1));
-            lua_close(L);
-            continue;
+        if (luaL_dofile(L, path)) {
+            res = rpc_error_object(RPC_ERROR_CODE_NOT_FOUND, json_string("Object not found"));
+            goto call_done;
         }
 
-        if (!lua_istable(L, -1)) {
-            uh_log_err("invalid rpc script, need return a table: %s\n", object_path);
-            lua_close(L);
-            continue;
+        lua_getfield(L, -1, ctx->method);
+        if (!lua_isfunction(L, -1)) {
+            res = rpc_error_object(RPC_ERROR_CODE_NOT_FOUND, json_string("Method not found"));
+            goto call_done;
         }
 
-        obj = calloc(1, sizeof(struct rpc_object) + strlen(e->d_name) + 1);
-        if (!obj) {
-            uh_log_err("calloc: %s\n", strerror(errno));
+        s = ctx->s;
+
+        if (!ctx->is_local && !rpc_is_no_auth(ctx->object, ctx->method) &&
+            (!s || !rpc_call_access(s, ctx->object, ctx->method))) {
+            res = rpc_error_object(RPC_ERROR_CODE_ACCESS, NULL);
+            goto call_done;
+        }
+
+        lua_newtable(L);
+
+        if (s) {
+            lua_pushstring(L, s->username);
+            lua_setfield(L, -2, "username");
+
+            lua_pushstring(L, s->aclgroup);
+            lua_setfield(L, -2, "aclgroup");
+        }
+
+        saddr2str((struct sockaddr *)ctx->conn->get_paddr(ctx->conn),
+            remote_addr, sizeof(remote_addr), &remote_port);
+
+        lua_pushinteger(L, remote_port);
+        lua_setfield(L, -2, "remote_port");
+
+        lua_pushstring(L, remote_addr);
+        lua_setfield(L, -2, "remote_addr");
+
+        lua_pushboolean(L, ctx->is_local);
+        lua_setfield(L, -2, "is_local");
+
+        lua_setglobal(L, "__oui_session");
+
+        if (ctx->args) {
+            json_to_lua(ctx->args, L);
+            json_decref(ctx->args);
+            ctx->args = NULL;
+        } else {
+            lua_newtable(L);
+        }
+
+        log_debug("call %s.%s...\n", ctx->object, ctx->method);
+
+        if (lua_pcall(L, 1, 2, 0)) {
+            const char *err_msg = lua_tostring(L, -1);
+            json_t *data = json_string(err_msg);
+
+            log_err("%s\n", err_msg);
+            res = rpc_error_object(RPC_ERROR_CODE_INTERNAL_ERROR, data);
+            goto call_done;
+        }
+
+        /*
+        * Return a number on failure (plus an error message as a second result)
+        * Return a table on success
+        * Return other type also as success, but the result will be ignored
+        */
+        if (lua_isnumber(L, -2)) {
+            json_t *data = NULL;
+
+            if (lua_isstring(L, -1))
+                data = json_string(lua_tostring(L, -1));
+            res = rpc_error_object(lua_tointeger(L, -2), data);
+        } else {
+            if (lua_istable(L, -2))
+                res = lua_to_json(L, -2, true);
+            is_err = false;
+        }
+
+call_done:
+        lua_close(L);
+
+        if (is_err)
+            ctx->res = rpc_error_response(ctx->id, res);
+        else
+            ctx->res = rpc_result_response(ctx->id, res);
+
+        json_decref(ctx->id);
+        ctx->id = NULL;
+
+        pthread_mutex_lock(&rpc_context.mutex);
+        list_add_tail(&ctx->node, &rpc_context.end_queue);
+
+        if (!ev_async_pending(&rpc_context.end_watcher)) {
+            struct uh_connection *conn = ctx->conn;
+            ev_async_send(conn->get_loop(conn), &rpc_context.end_watcher);
+        }
+        pthread_mutex_unlock(&rpc_context.mutex);
+    }
+
+done:
+    rpc_context.nworker--;
+    pthread_mutex_unlock(&rpc_context.mutex);
+    log_info("rpc worker(%d) quit\n", id);
+    return NULL;
+}
+
+static void call_end_cb(struct ev_loop *loop, struct ev_async *w, int revents)
+{
+    struct rpc_call_context *ctx;
+    struct uh_connection *conn;
+
+    while (true) {
+        pthread_mutex_lock(&rpc_context.mutex);
+        if (list_empty(&rpc_context.end_queue)) {
+            pthread_mutex_unlock(&rpc_context.mutex);
+            return;
+        }
+        ctx = list_first_entry(&rpc_context.end_queue, struct rpc_call_context, node);
+        conn = ctx->conn;
+        list_del(&ctx->node);
+        pthread_mutex_unlock(&rpc_context.mutex);
+
+        rpc_handle_done_final(ctx->conn, ctx->res);
+
+        conn->decref(conn);
+
+        log_debug("call %s.%s done\n", ctx->object, ctx->method);
+
+        json_decref(ctx->params);
+
+        free(ctx);
+    }
+}
+
+int rpc_init(struct ev_loop *loop, const char *path, bool local_auth, const char *no_auth_file, int nworker)
+{
+    int i;
+
+    rpc_context.loop = loop;
+    rpc_context.root = path;
+
+    load_no_auth_methods(no_auth_file);
+
+    INIT_LIST_HEAD(&rpc_context.run_queue);
+    INIT_LIST_HEAD(&rpc_context.end_queue);
+
+    pthread_mutex_init(&rpc_context.mutex, NULL);
+    pthread_cond_init(&rpc_context.cond, NULL);
+
+    rpc_context.local_auth = local_auth;
+
+    ev_async_init(&rpc_context.end_watcher, call_end_cb);
+    ev_async_start(loop, &rpc_context.end_watcher);
+
+    if (nworker > RPC_MAX_WORKER_NUM) {
+        nworker = RPC_MAX_WORKER_NUM;
+        log_info("The number of worker threads is limited to %d\n", nworker);
+    }
+
+    if (nworker < 0)
+        nworker = get_nprocs();
+
+    if (nworker == 1) {
+        nworker++;
+        log_info("At least 2 worker threads must be need\n");
+    }
+
+    for (i = 0; i < nworker; i++) {
+        pthread_t tid;
+
+        if (pthread_create(&tid, NULL, rpc_call_worker, (void *)(intptr_t)i)) {
+            log_err("pthread_create: %s\n", strerror(errno));
             break;
         }
 
-        obj->L = L;
-        strcpy(obj->value, e->d_name);
-        obj->avl.key = obj->value;
-        avl_init(&obj->trusted_methods, avl_strcmp, false, NULL);
-        avl_insert(&rpc_objects, &obj->avl);
+        pthread_detach(tid);
+
+        rpc_context.nworker++;
     }
 
-    closedir(dir);
-}
-
-static void free_all_trusted_methods(struct rpc_object *obj)
-{
-    struct rpc_trusted_method *m, *temp;
-
-    avl_for_each_element_safe(&obj->trusted_methods, m, avl, temp) {
-        avl_delete(&obj->trusted_methods, &m->avl);
-        free(m);
-    }
-}
-
-static void unload_rpc_scripts()
-{
-    struct rpc_object *obj, *temp;
-
-    avl_for_each_element_safe(&rpc_objects, obj, avl, temp) {
-        avl_delete(&rpc_objects, &obj->avl);
-        free_all_trusted_methods(obj);
-        lua_close(obj->L);
-        free(obj);
-    }
-}
-
-static int add_trusted_method(struct rpc_object *obj, const char *value)
-{
-    struct rpc_trusted_method *m = calloc(1, sizeof(struct rpc_trusted_method) + strlen(value) + 1);
-
-    if (!m) {
-        uh_log_err("calloc: %s\n", strerror(errno));
+    if (i < 1) {
+        log_err("no rpc call worker created\n");
         return -1;
     }
-
-    strcpy(m->value, value);
-    m->avl.key = m->value;
-
-    avl_insert(&obj->trusted_methods, &m->avl);
 
     return 0;
 }
 
-static int load_trusted()
+static void free_rpc_call_context(struct rpc_call_context *ctx)
 {
-    struct uci_context *uci = uci_alloc_context();
-    struct uci_package *p = NULL;
-    struct uci_section *s;
-    struct uci_element *e;
-    struct uci_ptr ptr = {.package = "oui-httpd"};
-    int ret = -1;
+    struct uh_connection *conn = ctx->conn;
 
-    if (!uci) {
-        uh_log_err("uci_alloc_context fail\n");
-        return -1;
-    }
+    json_decref(ctx->args);
+    json_decref(ctx->res);
+    json_decref(ctx->id);
 
-    uci_load(uci, ptr.package, &p);
+    list_del(&ctx->node);
 
-    if (!p) {
-        uh_log_err("Load config 'oui-httpd' fail\n");
-        goto err;
-    }
+    conn->decref(conn);
 
-    uci_foreach_element(&p->sections, e) {
-        struct rpc_object *obj;
+    free(ctx);
+}
 
-        s = uci_to_section(e);
+static void free_rpc_call_contexts()
+{
+    struct rpc_call_context *pos, *t;
 
-        if (strcmp(s->type, "trusted-object"))
-            continue;
+    list_for_each_entry_safe(pos, t, &rpc_context.run_queue, node)
+        free_rpc_call_context(pos);
 
-        ptr.section = s->e.name;
-        ptr.s = NULL;
+    list_for_each_entry_safe(pos, t, &rpc_context.end_queue, node)
+        free_rpc_call_context(pos);
+}
 
-        ptr.option = "object";
-        ptr.o = NULL;
+void rpc_deinit(struct ev_loop *loop)
+{
+    pthread_mutex_lock(&rpc_context.mutex);
+    rpc_context.done = true;
+    pthread_mutex_unlock(&rpc_context.mutex);
 
-        if (uci_lookup_ptr(uci, &ptr, NULL, true) || !ptr.o || ptr.o->type != UCI_TYPE_STRING)
-            continue;
+    pthread_cond_broadcast(&rpc_context.cond);
 
-        obj = avl_find_element(&rpc_objects, ptr.o->v.string, obj, avl);
-        if (!obj)
-            continue;
-
-        ptr.option = "method";
-        ptr.o = NULL;
-
-        if (uci_lookup_ptr(uci, &ptr, NULL, true) || !ptr.o)
-            continue;
-
-        if (ptr.o->type == UCI_TYPE_STRING) {
-            if (add_trusted_method(obj, ptr.o->v.string))
-                goto err;;
-        } else {
-            struct uci_element *oe;
-            uci_foreach_element(&ptr.o->v.list, oe) {
-                if (add_trusted_method(obj, oe->name))
-                    goto err;;
-            }
+    while (true) {
+        pthread_mutex_lock(&rpc_context.mutex);
+        if (rpc_context.nworker == 0) {
+            pthread_mutex_unlock(&rpc_context.mutex);
+            break;
         }
+        pthread_mutex_unlock(&rpc_context.mutex);
+
+        usleep(10000);
     }
 
-    ret = 0;
+    free_rpc_call_contexts();
 
-err:
-    if (p)
-        uci_unload(uci, p);
-
-    uci_free_context(uci);
-
-    return ret;
-}
-
-void rpc_init(const char *path)
-{
-    avl_init(&rpc_objects, avl_strcmp, false, NULL);
-
-    load_rpc_scripts(path);
-
-    load_trusted();
-}
-
-void rpc_deinit()
-{
-    unload_rpc_scripts();
+    json_decref(rpc_context.no_auth_methods);
 }

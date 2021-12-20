@@ -1,21 +1,20 @@
 local utils = require "oui.utils"
-local iwinfo = require 'iwinfo'
+local iwinfo = require 'oui.iwinfo'
 local rpc = require 'oui.rpc'
+local fs = require "oui.fs"
 
 local M = {}
 
-local function get_info(device)
-    local iwtype = iwinfo.type(device)
+function M.devices()
+    local devices = {}
 
-    if not iwtype then
-        error("Not support")
+    for dev in fs.dir("/sys/class/net") do
+        if iwinfo.type(dev) then
+            devices[#devices + 1] = dev
+        end
     end
 
-    return setmetatable({}, {
-        __index = function(t, k)
-            return iwinfo[iwtype][k] and iwinfo[iwtype][k](device)
-        end
-    })
+    return { devices = devices }
 end
 
 function M.info(params)
@@ -25,7 +24,7 @@ function M.info(params)
         return rpc.ERROR_CODE_INVALID_PARAMS
     end
 
-    local info = get_info(device)
+    local info = iwinfo.info(device)
 
     local hwmodes = {}
     local htmodes = {}
@@ -67,6 +66,26 @@ function M.info(params)
     }
 end
 
+function M.assoclist(params)
+    local device = params.device
+
+    if type(device) ~= "string" then
+        return rpc.ERROR_CODE_INVALID_PARAMS
+    end
+
+    return iwinfo.assoclist(device)
+end
+
+function M.scan(params)
+    local device = params.device
+
+    if type(device) ~= "string" then
+        return rpc.ERROR_CODE_INVALID_PARAMS
+    end
+
+    return iwinfo.scanlist(device)
+end
+
 function M.freqlist(params)
     local device = params.device
 
@@ -74,7 +93,7 @@ function M.freqlist(params)
         return rpc.ERROR_CODE_INVALID_PARAMS
     end
 
-    return get_info(device)['freqlist']
+    return iwinfo.freqlist(device)
 end
 
 function M.txpowerlist(params)
@@ -84,7 +103,7 @@ function M.txpowerlist(params)
         return rpc.ERROR_CODE_INVALID_PARAMS
     end
 
-    return get_info(device)['txpwrlist']
+    return iwinfo.txpwrlist(device)
 end
 
 function M.countrylist(params)
@@ -94,7 +113,7 @@ function M.countrylist(params)
         return rpc.ERROR_CODE_INVALID_PARAMS
     end
 
-    return get_info(device)['countrylist']
+    return iwinfo.countrylist(device)
 end
 
 return M

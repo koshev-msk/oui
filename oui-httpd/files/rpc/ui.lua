@@ -2,11 +2,13 @@ local sqlite3 = require "lsqlite3"
 local utils = require "oui.utils"
 local cjson = require "oui.json"
 local rpc = require "oui.rpc"
+local fs = require "oui.fs"
 local uci = require "uci"
 
 local M = {}
 
-local RPC_OUI_MENU_FILES = "/usr/share/oui/menu.d/*.json"
+local RPC_OUI_MENU_FILES_PATH = "/usr/share/oui/menu.d"
+local RPC_OUI_LOCALES_PATH = "/www/i18n"
 
 local function menu_files(files)
     for _, file in ipairs(files) do
@@ -40,29 +42,21 @@ end
 function M.menu(params)
     local menus = {}
 
-    local f = io.popen("ls " .. RPC_OUI_MENU_FILES .. " 2>/dev/null")
-    if f then
-        for file in f:lines() do
+    for name in fs.dir(RPC_OUI_MENU_FILES_PATH) do
+        if name:match("%.json$") then
+            local file = RPC_OUI_MENU_FILES_PATH .. "/" .. name
             local menu = cjson.decode(utils.readfile(file))
 
             for path, item in pairs(menu) do
-                local access, files = true, true
-                local tmp = {}
+                local files = not item.files or  menu_files(item.files)
 
-                for k, v in pairs(item) do
-                    if k == "files" then
-                        files = menu_files(v)
-                    else
-                        tmp[k] = v
-                    end
-                end
+                item.files = nil
 
                 if files and rpc.access("menu", "/" .. path, "r") then
-                    menus[path] = tmp
+                    menus[path] = item
                 end
             end
         end
-        f:close()
     end
 
     return {menu = menus}
@@ -75,15 +69,14 @@ function M.load_locales(params)
         return rpc.ERROR_CODE_INVALID_PARAMS
     end
 
-    local cmd = string.format("ls /www/i18n/*.%s.json 2>/dev/null", params.locale)
+    local match = string.format("%%.%s.json$", params.locale):gsub("%-", "%%-")
 
-    local f = io.popen(cmd)
-        if f then
-        for file in f:lines() do
+    for name in fs.dir(RPC_OUI_LOCALES_PATH) do
+        if name:match(match) then
+            local file = RPC_OUI_LOCALES_PATH .. "/" .. name
             local locale = cjson.decode(utils.readfile(file))
             locales[#locales + 1] = locale
         end
-        f:close()
     end
 
     return locales

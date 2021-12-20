@@ -25,19 +25,19 @@
 #ifndef __SESSION_H
 #define __SESSION_H
 
-#include <libubox/avl.h>
+#include <uhttpd/list.h>
+#include <stdbool.h>
 #include <ev.h>
 
-#include "stdbool.h"
-
-#define DEFAULT_SESSION_TIMEOUT 300
+#define MAX_SESSION     10
+#define SESSION_TIMEOUT 300
 
 #define MAX_SID_LEN      32
 #define MAX_USERNAME_LEN 32
 #define MAX_ACLGROUP_LEN 32
 
 struct session {
-    struct avl_node avl;
+    struct list_head node;
     char id[MAX_SID_LEN + 1];
     char username[MAX_USERNAME_LEN + 1];
     char aclgroup[MAX_ACLGROUP_LEN + 1];
@@ -46,8 +46,6 @@ struct session {
 
     int timeout;
 };
-
-void session_init();
 
 void session_deinit();
 

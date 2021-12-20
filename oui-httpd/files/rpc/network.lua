@@ -1,4 +1,4 @@
-local utils = require "oui.utils"
+local net = require "oui.network"
 local uci = require "uci"
 
 local M = {}
@@ -69,7 +69,7 @@ function M.dhcp6_leases()
             }
         end
     else
-        local r, lines = pcall(io.lines, dnsmasq_leasefile())
+        r, lines = pcall(io.lines, dnsmasq_leasefile())
         if r then
             for line in lines do
                 local ts, mac, addr, name, duid  = line:match("(%S+) +(%S+) +(%S+) +(%S+) +(%S+)")
@@ -119,8 +119,8 @@ function M.routes()
 
         if field[2] ~= "Destination" then
             routes[#routes + 1] = {
-                target = utils.parse_route_addr(field[2], field[8]),
-                nexthop = utils.parse_route_addr(field[3]),
+                target = net.hexaddr(field[2], field[8]),
+                nexthop = net.hexaddr(field[3]),
                 metric = field[7],
                 device = field[1]
             }
@@ -138,9 +138,9 @@ function M.routes6()
         end
 
         routes[#routes + 1] = {
-            target = utils.parse_route6_addr(field[1], field[2]),
-            source = utils.parse_route6_addr(field[3], field[4]),
-            nexthop = utils.parse_route6_addr(field[5]),
+            target = net.hex6addr(field[1], field[2]),
+            source = net.hex6addr(field[3], field[4]),
+            nexthop = net.hex6addr(field[5]),
             metric = tonumber(field[6], 16),
             device = field[10]
         }

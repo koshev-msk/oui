@@ -34,9 +34,10 @@ module.exports = {
     if (process.env.NODE_ENV === 'production') {
       return {
         plugins: [new CompressionPlugin({
-          test: /\.js$|\.html$|\.css/,
+          test: /\.js$|\.css$/,
           threshold: 4096,
-          deleteOriginalAssets: true
+          deleteOriginalAssets: true,
+          filename: '[path][base]?gz'
         })]
       }
     }

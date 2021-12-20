@@ -28,9 +28,12 @@
 #include <fcntl.h>
 
 #include "multipart_parser.h"
+#include "session.h"
+#include "utils.h"
 
 enum part {
     PART_UNKNOWN,
+    PART_SID,
     PART_PATH,
     PART_FILE
 };
@@ -40,10 +43,13 @@ struct state {
     bool is_content_disposition;
     enum part parttype;
     char path[256];
+    char sid[33];
+    bool authed;
     int fd;
 };
 
 const char *parts[] = {
+    "sid",
     "path",
     "file"
 };
@@ -91,16 +97,21 @@ static int data_begin_cb(struct multipart_parser *p)
     struct uh_connection *conn = st->conn;
 
     if (st->parttype == PART_FILE) {
+        if (!st->authed && !is_loopback_addr(conn->get_paddr(conn))) {
+            conn->send_error(conn, HTTP_STATUS_UNAUTHORIZED, NULL);
+            return 1;
+        }
+
         if (!st->path[0]) {
-            uh_log_err("Not found path\n");
-            conn->error(conn, HTTP_STATUS_FORBIDDEN, NULL);
+            log_err("Not found path\n");
+            conn->send_error(conn, HTTP_STATUS_FORBIDDEN, NULL);
             return 1;
         }
 
         st->fd = open(st->path, O_CREAT | O_TRUNC | O_WRONLY, S_IRUSR | S_IWUSR);
         if (st->fd < 0) {
-            uh_log_err("Create '%s' fail: %s\n", st->path, strerror(errno));
-            conn->error(conn, HTTP_STATUS_FORBIDDEN, NULL);
+            log_err("Create '%s' fail: %s\n", st->path, strerror(errno));
+            conn->send_error(conn, HTTP_STATUS_FORBIDDEN, NULL);
             return 1;
         }
     }
@@ -115,9 +126,17 @@ static int data_cb(struct multipart_parser *p, const char *data, size_t len)
     int wlen = len;
 
     switch (st->parttype) {
+    case PART_SID:
+        if (strlen(st->sid) + len > sizeof(st->sid) - 1) {
+            log_err("sid too long\n");
+            return 1;
+        }
+        strncat(st->sid, data, len);
+        break;
+
     case PART_PATH:
         if (strlen(st->path) + len > sizeof(st->path) - 1) {
-            uh_log_err("path too long\n");
+            log_err("path too long\n");
             return 1;
         }
         strncat(st->path, data, len);
@@ -126,8 +145,8 @@ static int data_cb(struct multipart_parser *p, const char *data, size_t len)
     case PART_FILE:
         if (write(st->fd, data, len) != wlen) {
             close(st->fd);
-            uh_log_err("write fail: %s\n", strerror(errno));
-            conn->error(conn, HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
+            log_err("write fail: %s\n", strerror(errno));
+            conn->send_error(conn, HTTP_STATUS_INTERNAL_SERVER_ERROR, NULL);
             return 1;
         }
 
@@ -144,7 +163,10 @@ static int data_end_cb(struct multipart_parser *p)
 {
     struct state *st = multipart_parser_get_data(p);
 
-    if (st->parttype == PART_FILE) {
+    if (st->parttype == PART_SID) {
+        if (session_get(st->sid))
+            st->authed = true;
+    } else if (st->parttype == PART_FILE) {
         close(st->fd);
     }
 
@@ -159,11 +181,12 @@ static int body_end_cb(struct multipart_parser *p)
 
     if (st->fd > 0) {
         conn->send_head(conn, HTTP_STATUS_OK, 2, NULL);
+        conn->end_headers(conn);
         conn->send(conn, "OK", 2);
         return 0;
     }
 
-    conn->error(conn, HTTP_STATUS_FORBIDDEN, NULL);
+    conn->send_error(conn, HTTP_STATUS_FORBIDDEN, NULL);
     return 1;
 }
 
@@ -183,26 +206,26 @@ static struct multipart_parser *init_parser(struct uh_connection *conn)
     char *boundary;
 
     if (conn->get_method(conn) != HTTP_POST) {
-        conn->error(conn, HTTP_STATUS_METHOD_NOT_ALLOWED, NULL);
+        conn->send_error(conn, HTTP_STATUS_METHOD_NOT_ALLOWED, NULL);
         return NULL;
     }
 
     if (!var.p || var.len < 20 || strncmp(var.p, "multipart/form-data;", 20)) {
-        conn->error(conn, HTTP_STATUS_BAD_REQUEST, NULL);
+        conn->send_error(conn, HTTP_STATUS_BAD_REQUEST, NULL);
         return NULL;
     }
 
     for (var.p += 20, var.len -= 20; var.len > 0 && *var.p != '='; var.p++, var.len--);
 
     if (*var.p++ != '=') {
-        conn->error(conn, HTTP_STATUS_BAD_REQUEST, NULL);
+        conn->send_error(conn, HTTP_STATUS_BAD_REQUEST, NULL);
         return NULL;
     }
     var.len--;
 
     boundary = malloc(var.len + 3);
     if (!boundary) {
-        conn->error(conn, HTTP_STATUS_SERVICE_UNAVAILABLE, NULL);
+        conn->send_error(conn, HTTP_STATUS_SERVICE_UNAVAILABLE, NULL);
         return NULL;
     }
 
@@ -226,21 +249,26 @@ static struct multipart_parser *init_parser(struct uh_connection *conn)
 
 void serve_upload(struct uh_connection *conn, int event)
 {
-    static struct multipart_parser *p;
+    if (!conn->userdata) {
+        conn->userdata = init_parser(conn);
+        if (!conn->userdata)
+            return;
+    }
 
     if (event == UH_EV_BODY) {
+        struct multipart_parser *p = conn->userdata;
         struct uh_str body = conn->extract_body(conn);
 
-        if (!p) {
-            p = init_parser(conn);
-            if (!p)
-                return;
+        if (multipart_parser_execute(p, body.p, body.len) != body.len) {
+            multipart_parser_free(p);
+            conn->userdata = NULL;
         }
-
-        multipart_parser_execute(p, body.p, body.len);
     } else if (event == UH_EV_COMPLETE) {
+        struct multipart_parser *p = conn->userdata;
+
         multipart_parser_free(p);
-        p = NULL;
-        conn->done(conn);
+        conn->userdata = NULL;
+
+        conn->end_response(conn);
     }
 }
